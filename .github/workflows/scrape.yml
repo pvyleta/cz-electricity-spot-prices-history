@@ -23,8 +23,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Scrape yesterday's data
-        run: python scrape.py --yesterday
+      - name: Scrape OTE electricity prices (yesterday)
+        run: python scrape_ote.py --yesterday
+
+      - name: Scrape CNB exchange rates (current year)
+        run: python scrape_cnb.py --current
 
       - name: Commit and push if changed
         run: |

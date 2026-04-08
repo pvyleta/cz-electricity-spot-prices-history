@@ -36,7 +36,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://www.ote-cr.cz/pubweb/attachments/01"
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent / "data" / "ote"
 
 # Row 22 = header, row 23 = blank, row 24 = first data — true for both XLSX formats.
 DATA_START_ROW = 24
