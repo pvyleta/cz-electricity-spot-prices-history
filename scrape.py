@@ -1,26 +1,19 @@
 """
-Scraper for Czech electricity spot prices from OTE-CR.
+Scraper for OTE-CR Czech electricity day-ahead spot prices.
 
-Data sources (in order of preference):
-  1. XLSX files from pubweb — used for recent/current data (2025-10-01+).
-     These contain both 15min and 1h prices in a single download.
-  2. JSON chart-data API — used as fallback for historical data (pre-2025).
-     The same API the OTE website uses to render charts; works back to 2002.
-     No XLSX parsing needed, zero extra dependencies.
+Resolution strategy per date:
+  >= 2025-01-01  try 15min XLSX (available from 2025-10-01), fall back to 1h XLSX
+  <  2025-01-01  hit the JSON chart-data API directly (same source, no XLSX needed,
+                 works back to 2002)
 
-Auto-detects resolution: tries 15min XLSX → 1h XLSX → JSON 1h.
+Output: data/1h/YYYY.csv and data/15min/YYYY.csv
 
 Usage:
-    # Scrape a single day
     python scrape.py --date 2026-04-08
-
-    # Scrape a date range
     python scrape.py --from 2015-01-01 --to 2024-12-31
+    python scrape.py --yesterday          # cron entry point
 
-    # Scrape yesterday (for cron)
-    python scrape.py --yesterday
-
-Dependencies: openpyxl, requests
+Dependencies:
     pip install openpyxl requests
 """
 
@@ -45,9 +38,7 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://www.ote-cr.cz/pubweb/attachments/01"
 DATA_DIR = Path(__file__).parent / "data"
 
-# XLSX layout constants (both formats share the same header row position)
-HEADER_ROW = 22
-# Row 22 = header, row 23 = empty, row 24 = first data row
+# Row 22 = header, row 23 = blank, row 24 = first data — true for both XLSX formats.
 DATA_START_ROW = 24
 
 
@@ -60,7 +51,7 @@ def xlsx_url_1h(d: date) -> str:
 
 
 def download_xlsx(url: str) -> bytes | None:
-    """Download XLSX, return bytes or None if not found."""
+    """Return raw XLSX bytes, or None on 404 / network error."""
     try:
         resp = requests.get(url, timeout=30)
         if resp.status_code == 200 and len(resp.content) > 500:
@@ -72,58 +63,48 @@ def download_xlsx(url: str) -> bytes | None:
 
 
 def parse_15min_xlsx(data: bytes, d: date) -> tuple[list[dict], list[dict]]:
-    """Parse 15min XLSX. Returns (rows_15min, rows_1h).
+    """Parse the 15min XLSX. Returns (rows_15min, rows_1h).
 
-    The 15min XLSX contains both 15min prices (col C) and 1h prices (col L).
-    We extract both to avoid needing a separate 1h download.
+    The file embeds both resolutions: col C = 15min price, col L = 1h price.
+    Extracting both here avoids a second download for the 1h CSV.
     """
     wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     ws = wb.active
 
     rows_15min = []
     rows_1h = []
-    seen_1h_intervals = set()  # deduplicate 1h prices (repeated per 15min slot)
+    seen_hours: set[str] = set()  # col L repeats the same 1h price for each slot in the hour
 
     for row in ws.iter_rows(min_row=DATA_START_ROW, values_only=True):
         period_num = row[0]
         if period_num is None or not isinstance(period_num, (int, float)):
-            break  # end of data (e.g. "Celkem" row)
+            break  # "Celkem" summary row signals end of data
 
-        time_interval = row[1]  # e.g. "00:00-00:15"
-        price_15min = row[2]    # 15min price EUR/MWh
-        price_1h = row[11]      # 60min price EUR/MWh (col L, index 11)
+        time_interval = row[1]  # "HH:MM-HH:MM"
+        price_15min = row[2]    # col C — 15min price EUR/MWh
+        price_1h = row[11]      # col L — 1h price EUR/MWh
 
         time_from, time_to = time_interval.split("-")
+        rows_15min.append({"date": d.isoformat(), "time_from": time_from,
+                           "time_to": time_to, "price_eur_mwh": price_15min})
 
-        rows_15min.append({
-            "date": d.isoformat(),
-            "time_from": time_from,
-            "time_to": time_to,
-            "price_eur_mwh": price_15min,
-        })
-
-        # 1h price is the same for every 15min slot within the hour — deduplicate
-        if price_1h is not None and time_from not in seen_1h_intervals:
-            # Derive the hour boundary from the 15min slot
-            hour_start = time_from[:3] + "00"  # e.g. "21:00"
+        hour_start = time_from[:2] + ":00"
+        if price_1h is not None and hour_start not in seen_hours:
+            seen_hours.add(hour_start)
             hour_end_h = int(time_from[:2]) + 1
-            hour_end = f"{hour_end_h:02d}:00" if hour_end_h < 24 else "24:00"
-
-            if hour_start not in seen_1h_intervals:
-                seen_1h_intervals.add(hour_start)
-                rows_1h.append({
-                    "date": d.isoformat(),
-                    "time_from": hour_start,
-                    "time_to": hour_end,
-                    "price_eur_mwh": price_1h,
-                })
+            rows_1h.append({
+                "date": d.isoformat(),
+                "time_from": hour_start,
+                "time_to": f"{hour_end_h:02d}:00" if hour_end_h < 24 else "24:00",
+                "price_eur_mwh": price_1h,
+            })
 
     wb.close()
     return rows_15min, rows_1h
 
 
 def parse_1h_xlsx(data: bytes, d: date) -> list[dict]:
-    """Parse 1h-only XLSX (older format). Returns rows for 1h CSV."""
+    """Parse the 1h-only XLSX (2025-01-01 – 2025-09-30). Col A = hour (1-24), col B = price."""
     wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     ws = wb.active
 
@@ -152,11 +133,10 @@ CSV_HEADER = ["date", "time_from", "time_to", "price_eur_mwh"]
 
 
 def scrape_day_json(d: date) -> list[dict]:
-    """Fetch 1h prices via the JSON chart-data API (pre-2025 fallback).
+    """Fetch 1h prices from OTE's chart-data JSON API.
 
-    OTE's own charting API; available for all dates back to 2002.
-    The response contains multiple dataLine objects — we select the one
-    where useY2=False, which is always the price line (EUR/MWh).
+    Same endpoint the website uses for its charts; available back to 2002.
+    The response has multiple dataLine objects; useY2=False identifies the price series.
     """
     params = {"report_date": d.isoformat(), "time_resolution": "PT60M"}
     try:
@@ -168,7 +148,6 @@ def scrape_day_json(d: date) -> list[dict]:
         log.warning("JSON API failed for %s: %s", d, e)
         return []
 
-    # Find the price line — it's the only dataLine with useY2=False
     price_line = next(
         (dl for dl in payload["data"]["dataLine"] if not dl.get("useY2", True)),
         None,
@@ -190,7 +169,7 @@ def scrape_day_json(d: date) -> list[dict]:
 
 
 def append_to_csv(filepath: Path, rows: list[dict]) -> None:
-    """Append rows to a CSV file, creating it with header if needed."""
+    """Append rows to CSV, writing the header on first write."""
     filepath.parent.mkdir(parents=True, exist_ok=True)
     file_exists = filepath.exists() and filepath.stat().st_size > 0
 
@@ -202,7 +181,7 @@ def append_to_csv(filepath: Path, rows: list[dict]) -> None:
 
 
 def date_already_scraped(filepath: Path, d: date) -> bool:
-    """Check if data for a given date already exists in the CSV."""
+    """Return True if the CSV already contains a row for this date."""
     if not filepath.exists():
         return False
     with open(filepath, "r", encoding="utf-8") as f:
@@ -219,51 +198,40 @@ XLSX_AVAILABLE_FROM = date(2025, 1, 1)
 
 
 def scrape_day(d: date) -> bool:
-    """Scrape a single day. Returns True if any data was written."""
+    """Scrape one day. Returns True if rows were written."""
     csv_15min = DATA_DIR / "15min" / f"{d.year}.csv"
-    csv_1h = DATA_DIR / "1h" / f"{d.year}.csv"
+    csv_1h    = DATA_DIR / "1h"    / f"{d.year}.csv"
 
-    # Skip if already scraped (check both — 15min may not exist for older dates)
     if date_already_scraped(csv_1h, d):
         log.debug("Already scraped %s, skipping", d)
         return False
 
     if d >= XLSX_AVAILABLE_FROM:
-        # Try 15min first (available since 2025-10-01)
-        url_15 = xlsx_url_15min(d)
-        log.info("Trying 15min: %s", url_15)
-        data = download_xlsx(url_15)
-
+        # 15min XLSX (available from 2025-10-01) embeds both resolutions.
+        data = download_xlsx(xlsx_url_15min(d))
         if data:
             rows_15, rows_1h = parse_15min_xlsx(data, d)
-            log.info("  %s: got %d 15min rows, %d 1h rows", d, len(rows_15), len(rows_1h))
-            if rows_15:
-                append_to_csv(csv_15min, rows_15)
-            if rows_1h:
-                append_to_csv(csv_1h, rows_1h)
+            log.info("%s: %d 15min rows, %d 1h rows (XLSX)", d, len(rows_15), len(rows_1h))
+            if rows_15: append_to_csv(csv_15min, rows_15)
+            if rows_1h: append_to_csv(csv_1h, rows_1h)
             return True
 
-        # Fall back to 1h-only XLSX
-        url_1 = xlsx_url_1h(d)
-        log.info("Trying 1h: %s", url_1)
-        data = download_xlsx(url_1)
-
+        # 1h-only XLSX covers 2025-01-01 – 2025-09-30.
+        data = download_xlsx(xlsx_url_1h(d))
         if data:
             rows = parse_1h_xlsx(data, d)
-            log.info("  %s: got %d 1h rows", d, len(rows))
-            if rows:
-                append_to_csv(csv_1h, rows)
+            log.info("%s: %d 1h rows (XLSX)", d, len(rows))
+            if rows: append_to_csv(csv_1h, rows)
             return True
 
-    # JSON API: primary path for pre-2025, fallback for 2025+ if XLSX fails
-    log.info("Trying JSON API for %s", d)
+    # Pre-2025 dates have no XLSX on pubweb; JSON API covers everything back to 2002.
     rows = scrape_day_json(d)
     if rows:
-        log.info("  %s: got %d 1h rows (JSON)", d, len(rows))
+        log.info("%s: %d 1h rows (JSON)", d, len(rows))
         append_to_csv(csv_1h, rows)
         return True
 
-    log.warning("No data available for %s", d)
+    log.warning("No data for %s", d)
     return False
 
 
