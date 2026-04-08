@@ -1,16 +1,21 @@
 """
 Scraper for Czech electricity spot prices from OTE-CR.
 
-Downloads daily XLSX reports and extracts spot prices into per-year CSV files.
-Auto-detects whether 15-minute resolution data is available (post ~2025)
-or only 1-hour resolution (pre ~2025).
+Data sources (in order of preference):
+  1. XLSX files from pubweb — used for recent/current data (2025-10-01+).
+     These contain both 15min and 1h prices in a single download.
+  2. JSON chart-data API — used as fallback for historical data (pre-2025).
+     The same API the OTE website uses to render charts; works back to 2002.
+     No XLSX parsing needed, zero extra dependencies.
+
+Auto-detects resolution: tries 15min XLSX → 1h XLSX → JSON 1h.
 
 Usage:
     # Scrape a single day
     python scrape.py --date 2026-04-08
 
     # Scrape a date range
-    python scrape.py --from 2025-01-01 --to 2025-12-31
+    python scrape.py --from 2015-01-01 --to 2024-12-31
 
     # Scrape yesterday (for cron)
     python scrape.py --yesterday
@@ -142,7 +147,46 @@ def parse_1h_xlsx(data: bytes, d: date) -> list[dict]:
     return rows
 
 
+JSON_API = "https://www.ote-cr.cz/cs/kratkodobe-trhy/elektrina/denni-trh/@@chart-data"
 CSV_HEADER = ["date", "time_from", "time_to", "price_eur_mwh"]
+
+
+def scrape_day_json(d: date) -> list[dict]:
+    """Fetch 1h prices via the JSON chart-data API (pre-2025 fallback).
+
+    OTE's own charting API; available for all dates back to 2002.
+    The response contains multiple dataLine objects — we select the one
+    where useY2=False, which is always the price line (EUR/MWh).
+    """
+    params = {"report_date": d.isoformat(), "time_resolution": "PT60M"}
+    try:
+        resp = requests.get(JSON_API, params=params, timeout=30)
+        if resp.status_code != 200:
+            return []
+        payload = resp.json()
+    except Exception as e:
+        log.warning("JSON API failed for %s: %s", d, e)
+        return []
+
+    # Find the price line — it's the only dataLine with useY2=False
+    price_line = next(
+        (dl for dl in payload["data"]["dataLine"] if not dl.get("useY2", True)),
+        None,
+    )
+    if not price_line:
+        log.warning("No price dataLine in JSON response for %s", d)
+        return []
+
+    rows = []
+    for pt in price_line["point"]:
+        hour = int(pt["x"])
+        rows.append({
+            "date": d.isoformat(),
+            "time_from": f"{hour - 1:02d}:00",
+            "time_to": f"{hour:02d}:00" if hour < 24 else "24:00",
+            "price_eur_mwh": pt["y"],
+        })
+    return rows
 
 
 def append_to_csv(filepath: Path, rows: list[dict]) -> None:
@@ -169,6 +213,11 @@ def date_already_scraped(filepath: Path, d: date) -> bool:
     return False
 
 
+# XLSX files are only published on pubweb from 2025 onwards.
+# For earlier dates, skip straight to the JSON API to avoid wasted requests.
+XLSX_AVAILABLE_FROM = date(2025, 1, 1)
+
+
 def scrape_day(d: date) -> bool:
     """Scrape a single day. Returns True if any data was written."""
     csv_15min = DATA_DIR / "15min" / f"{d.year}.csv"
@@ -179,30 +228,39 @@ def scrape_day(d: date) -> bool:
         log.debug("Already scraped %s, skipping", d)
         return False
 
-    # Try 15min first (available since ~late 2025)
-    url_15 = xlsx_url_15min(d)
-    log.info("Trying 15min: %s", url_15)
-    data = download_xlsx(url_15)
+    if d >= XLSX_AVAILABLE_FROM:
+        # Try 15min first (available since 2025-10-01)
+        url_15 = xlsx_url_15min(d)
+        log.info("Trying 15min: %s", url_15)
+        data = download_xlsx(url_15)
 
-    if data:
-        rows_15, rows_1h = parse_15min_xlsx(data, d)
-        log.info("  %s: got %d 15min rows, %d 1h rows", d, len(rows_15), len(rows_1h))
-        if rows_15:
-            append_to_csv(csv_15min, rows_15)
-        if rows_1h:
-            append_to_csv(csv_1h, rows_1h)
-        return True
+        if data:
+            rows_15, rows_1h = parse_15min_xlsx(data, d)
+            log.info("  %s: got %d 15min rows, %d 1h rows", d, len(rows_15), len(rows_1h))
+            if rows_15:
+                append_to_csv(csv_15min, rows_15)
+            if rows_1h:
+                append_to_csv(csv_1h, rows_1h)
+            return True
 
-    # Fall back to 1h-only format
-    url_1 = xlsx_url_1h(d)
-    log.info("Trying 1h: %s", url_1)
-    data = download_xlsx(url_1)
+        # Fall back to 1h-only XLSX
+        url_1 = xlsx_url_1h(d)
+        log.info("Trying 1h: %s", url_1)
+        data = download_xlsx(url_1)
 
-    if data:
-        rows = parse_1h_xlsx(data, d)
-        log.info("  %s: got %d 1h rows", d, len(rows))
-        if rows:
-            append_to_csv(csv_1h, rows)
+        if data:
+            rows = parse_1h_xlsx(data, d)
+            log.info("  %s: got %d 1h rows", d, len(rows))
+            if rows:
+                append_to_csv(csv_1h, rows)
+            return True
+
+    # JSON API: primary path for pre-2025, fallback for 2025+ if XLSX fails
+    log.info("Trying JSON API for %s", d)
+    rows = scrape_day_json(d)
+    if rows:
+        log.info("  %s: got %d 1h rows (JSON)", d, len(rows))
+        append_to_csv(csv_1h, rows)
         return True
 
     log.warning("No data available for %s", d)
